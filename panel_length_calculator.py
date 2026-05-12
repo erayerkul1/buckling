@@ -32,6 +32,7 @@ from PyQt5.QtGui import QColor
 
 SHELL_TYPES = {"CQUAD4": 4, "CQUAD8": 4, "CTRIA3": 3, "CTRIA6": 3}
 BAR_TYPES   = {"CBAR", "CBEAM", "CROD", "CTUBE"}
+PLANE_AXES  = {"XZ": [0, 2], "ZY": [2, 1], "XY": [0, 1]}
 
 
 def load_bdf(bdf_path: str) -> BDF:
@@ -40,63 +41,66 @@ def load_bdf(bdf_path: str) -> BDF:
     return model
 
 
-def _node_coords(model, nids):
-    return {n: np.array(model.nodes[n].get_position(), dtype=float) for n in nids}
+def build_bar_prop_nodes(model: BDF) -> dict[int, set]:
+    """Bar property → node ID seti. Model başına bir kez hesaplanır."""
+    prop_nodes: dict[int, set] = {}
+    for elem in model.elements.values():
+        if elem.type in BAR_TYPES:
+            prop_nodes.setdefault(elem.pid, set()).update(elem.node_ids)
+    return prop_nodes
 
 
-def get_corner_nodes(model: BDF, pid: int) -> dict:
-    nids = set()
+def get_nodes_for_property(model: BDF, pid: int) -> tuple[dict, dict]:
+    """
+    Tek geçişte hem köşe hem tüm node koordinatlarını döndürür.
+    Returns: (corner_coords, all_coords)
+    """
+    corner_nids: set = set()
+    all_nids:    set = set()
     for elem in model.elements.values():
         if elem.pid == pid and elem.type in SHELL_TYPES:
-            nids.update(elem.node_ids[:SHELL_TYPES[elem.type]])
-    if not nids:
+            nids = elem.node_ids
+            corner_nids.update(nids[:SHELL_TYPES[elem.type]])
+            all_nids.update(nids)
+    if not corner_nids:
         raise ValueError(f"Property ID {pid} için shell eleman bulunamadı.")
-    return _node_coords(model, nids)
-
-
-def get_all_nodes(model: BDF, pid: int) -> dict:
-    nids = set()
-    for elem in model.elements.values():
-        if elem.pid == pid and elem.type in SHELL_TYPES:
-            nids.update(elem.node_ids)
-    return _node_coords(model, nids)
+    get_pos = lambda n: np.array(model.nodes[n].get_position(), dtype=float)
+    all_c    = {n: get_pos(n) for n in all_nids}
+    corner_c = {n: all_c[n]  for n in corner_nids}
+    return corner_c, all_c
 
 
 def detect_plane(coords: dict) -> str:
     pts = np.array(list(coords.values()))
-    min_ax = int(np.argmin(pts.var(axis=0)))
-    return {0: "ZY", 1: "XZ", 2: "XY"}[min_ax]
-
-
-def project_2d(coords: dict, plane: str) -> dict:
-    axes = {"XZ": [0, 2], "ZY": [2, 1], "XY": [0, 1]}[plane]
-    return {n: pt[axes] for n, pt in coords.items()}
+    return {0: "ZY", 1: "XZ", 2: "XY"}[int(np.argmin(pts.var(axis=0)))]
 
 
 def find_corners(coords: dict, plane: str) -> list:
-    proj  = project_2d(coords, plane)
-    nids  = list(proj.keys())
-    pts2d = np.array([proj[n] for n in nids])
+    axes  = PLANE_AXES[plane]
+    nids  = list(coords.keys())
+    pts2d = np.array([coords[n][axes] for n in nids])
+    nid_idx = {n: i for i, n in enumerate(nids)}  # O(1) lookup
 
     if len(nids) < 4:
         raise ValueError("4'ten az köşe node bulundu.")
     if len(nids) == 4:
         return nids
 
-    hull_idx = ConvexHull(pts2d).vertices
-    hull_nids = [nids[i] for i in hull_idx]
+    hull_nids = [nids[i] for i in ConvexHull(pts2d).vertices]
     if len(hull_nids) == 4:
         return hull_nids
 
+    # En geniş dörtgeni bul (maksimum alan)
     best_area, best_quad = -1, None
     for quad in combinations(hull_nids, 4):
-        qp = pts2d[[nids.index(n) for n in quad]]
+        qp = pts2d[[nid_idx[n] for n in quad]]
         c  = qp.mean(axis=0)
         o  = np.argsort(np.arctan2(qp[:,1]-c[1], qp[:,0]-c[0]))
         op = qp[o]
-        area = 0.5 * abs(sum(
-            op[i][0]*op[(i+1)%4][1] - op[(i+1)%4][0]*op[i][1] for i in range(4)
-        ))
+        area = 0.5 * abs(
+            op[0,0]*(op[1,1]-op[3,1]) + op[1,0]*(op[2,1]-op[0,1]) +
+            op[2,0]*(op[3,1]-op[1,1]) + op[3,0]*(op[0,1]-op[2,1])
+        )
         if area > best_area:
             best_area = area
             best_quad = [quad[i] for i in o]
@@ -104,47 +108,35 @@ def find_corners(coords: dict, plane: str) -> list:
 
 
 def order_ccw(corner_nids: list, coords: dict, plane: str) -> list:
-    proj = project_2d({n: coords[n] for n in corner_nids}, plane)
-    pts  = np.array([proj[n] for n in corner_nids])
+    axes = PLANE_AXES[plane]
+    pts  = np.array([coords[n][axes] for n in corner_nids])
     c    = pts.mean(axis=0)
     ang  = np.arctan2(pts[:,1]-c[1], pts[:,0]-c[0])
     return [corner_nids[i] for i in np.argsort(ang)]
 
 
-def dist(a: np.ndarray, b: np.ndarray) -> float:
-    return float(np.linalg.norm(a - b))
-
-
-def nodes_on_segment(all_coords: dict, a: int, b: int) -> set:
-    pa, pb   = all_coords[a], all_coords[b]
+def nodes_on_segment(all_nids: list, all_pts: np.ndarray,
+                     pa: np.ndarray, pb: np.ndarray) -> set:
+    """Numpy vektör işlemleriyle kenar üzerindeki node'ları bulur."""
     edge_vec = pb - pa
     edge_lsq = float(np.dot(edge_vec, edge_vec))
     edge_len = np.sqrt(edge_lsq)
     tol_perp = max(0.01 * edge_len, 1e-3)
     tol_t    = 1e-4
 
-    on_edge = set()
-    for nid, pt in all_coords.items():
-        v = pt - pa
-        t = float(np.dot(v, edge_vec)) / edge_lsq if edge_lsq > 0 else 0.0
-        if t < -tol_t or t > 1.0 + tol_t:
-            continue
-        if np.linalg.norm(pt - (pa + t * edge_vec)) < tol_perp:
-            on_edge.add(nid)
-    return on_edge
+    v    = all_pts - pa                          # (N, 3)
+    t    = (v @ edge_vec) / edge_lsq            # (N,)
+    mask = (t >= -tol_t) & (t <= 1.0 + tol_t)
+    proj = pa + t[:, None] * edge_vec           # (N, 3)
+    perp = np.linalg.norm(all_pts - proj, axis=1)
+    mask &= (perp < tol_perp)
+    return {all_nids[i] for i in np.where(mask)[0]}
 
 
-def find_bar_prop(model: BDF, edge_nodes: set) -> tuple:
-    """En fazla ortak node'a sahip bar property'yi döndürür."""
-    prop_nodes: dict = {}
-    for elem in model.elements.values():
-        if elem.type not in BAR_TYPES:
-            continue
-        pid = elem.pid
-        prop_nodes.setdefault(pid, set()).update(elem.node_ids)
-
+def find_bar_prop(bar_prop_nodes: dict, edge_nodes: set) -> tuple:
+    """Önceden hesaplanmış haritadan en iyi bar property'yi seçer."""
     best_pid, best_n = None, 0
-    for pid, bar_nids in prop_nodes.items():
+    for pid, bar_nids in bar_prop_nodes.items():
         shared = len(edge_nodes & bar_nids)
         if shared > best_n:
             best_n, best_pid = shared, pid
@@ -172,23 +164,26 @@ def get_bar_dims(model: BDF, bar_pid) -> tuple:
     return None, None
 
 
-def compute(bdf_path: str, pid: int) -> dict:
+def compute(model: BDF, bar_prop_nodes: dict, pid: int) -> dict:
     """
-    Döndürür:
-        property_id, plane, x_length, y_length, x_direction,
-        bars: { x1, x2, y1, y2 → {pid, dim1, dim2, shared_nodes} }
+    model ve bar_prop_nodes dışarıdan verilir (bir kez yüklenir).
+    Döndürür: property_id, plane, x_length, y_length, x_direction,
+              bars, avg_dim1_x, avg_dim2_x, avg_dim1_y, avg_dim2_y
     """
-    model        = load_bdf(bdf_path)
-    corner_c     = get_corner_nodes(model, pid)
-    all_c        = get_all_nodes(model, pid)
-    plane        = detect_plane(corner_c)
-    corners      = find_corners(corner_c, plane)
+    corner_c, all_c = get_nodes_for_property(model, pid)
+
+    plane   = detect_plane(corner_c)
+    corners = find_corners(corner_c, plane)
     bl, br, tr, tl = order_ccw(corners, corner_c, plane)
 
-    bottom = dist(corner_c[bl], corner_c[br])
-    right  = dist(corner_c[br], corner_c[tr])
-    top    = dist(corner_c[tr], corner_c[tl])
-    left   = dist(corner_c[tl], corner_c[bl])
+    # Numpy array'e çevir → vektörize segment kontrolü için
+    all_nids_list = list(all_c.keys())
+    all_pts       = np.array([all_c[n] for n in all_nids_list])
+
+    bottom = float(np.linalg.norm(corner_c[bl] - corner_c[br]))
+    right  = float(np.linalg.norm(corner_c[br] - corner_c[tr]))
+    top    = float(np.linalg.norm(corner_c[tr] - corner_c[tl]))
+    left   = float(np.linalg.norm(corner_c[tl] - corner_c[bl]))
 
     h_avg, v_avg = (bottom + top) / 2, (left + right) / 2
 
@@ -203,19 +198,14 @@ def compute(bdf_path: str, pid: int) -> dict:
 
     bars = {}
     for label, na, nb in x_edges + y_edges:
-        seg        = nodes_on_segment(all_c, na, nb)
-        bpid, shn  = find_bar_prop(model, seg)
+        seg        = nodes_on_segment(all_nids_list, all_pts, corner_c[na], corner_c[nb])
+        bpid, shn  = find_bar_prop(bar_prop_nodes, seg)
         d1, d2     = get_bar_dims(model, bpid)
         bars[label] = {"pid": bpid, "dim1": d1, "dim2": d2, "shared_nodes": shn}
 
     def _avg(vals):
         v = [x for x in vals if x is not None]
         return round(sum(v) / len(v), 6) if v else None
-
-    avg_dim1_x = _avg([bars["x1"]["dim1"], bars["x2"]["dim1"]])
-    avg_dim2_x = _avg([bars["x1"]["dim2"], bars["x2"]["dim2"]])
-    avg_dim1_y = _avg([bars["y1"]["dim1"], bars["y2"]["dim1"]])
-    avg_dim2_y = _avg([bars["y1"]["dim2"], bars["y2"]["dim2"]])
 
     return {
         "property_id": pid,
@@ -224,10 +214,10 @@ def compute(bdf_path: str, pid: int) -> dict:
         "y_length":    round(y_len, 4),
         "x_direction": x_dir,
         "bars":        bars,
-        "avg_dim1_x":  avg_dim1_x,
-        "avg_dim2_x":  avg_dim2_x,
-        "avg_dim1_y":  avg_dim1_y,
-        "avg_dim2_y":  avg_dim2_y,
+        "avg_dim1_x":  _avg([bars["x1"]["dim1"], bars["x2"]["dim1"]]),
+        "avg_dim2_x":  _avg([bars["x1"]["dim2"], bars["x2"]["dim2"]]),
+        "avg_dim1_y":  _avg([bars["y1"]["dim1"], bars["y2"]["dim1"]]),
+        "avg_dim2_y":  _avg([bars["y1"]["dim2"], bars["y2"]["dim2"]]),
     }
 
 
@@ -315,9 +305,19 @@ class Worker(QObject):
         self.pids     = pids
 
     def run(self):
+        # BDF ve bar haritası bir kez yüklenir, tüm PID'ler için paylaşılır
+        try:
+            model          = load_bdf(self.bdf_path)
+            bar_prop_nodes = build_bar_prop_nodes(model)
+        except Exception as e:
+            for pid in self.pids:
+                self.err_done.emit(pid, f"BDF yüklenemedi: {e}")
+            self.finished.emit()
+            return
+
         for i, pid in enumerate(self.pids):
             try:
-                self.row_done.emit(compute(self.bdf_path, pid))
+                self.row_done.emit(compute(model, bar_prop_nodes, pid))
             except Exception as e:
                 self.err_done.emit(pid, str(e))
             self.progress.emit(i + 1, len(self.pids))
