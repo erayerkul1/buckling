@@ -1,23 +1,42 @@
 $ pyNastran : punch=True
-$ Test BDF - Panel in XZ plane (Y=1720 constant)
-$ Corners: (17190,1720,2628), (17331,1720,2628), (17329,1720,2473.8), (17190,1720,2478.8)
+$ Panel in XZ plane (Y=1720 constant)
+$ Corner nodes: 1(bl),2(br),3(tr),4(tl)  Mid-edge: 5,6,7,8
 $
-$ GRID nodes - Corner nodes
-GRID    1       0       17190.  1720.   2628.
-GRID    2       0       17331.  1720.   2628.
-GRID    3       0       17329.  1720.   2473.8
-GRID    4       0       17190.  1720.   2478.8
+$ ── GRID nodes ──────────────────────────────────────────
+$ Corner nodes
+GRID    1       0       17190.  1720.   2478.8
+GRID    2       0       17329.  1720.   2473.8
+GRID    3       0       17331.  1720.   2628.
+GRID    4       0       17190.  1720.   2628.
 $ Mid-edge nodes
-GRID    5       0       17267.  1720.   2628.
+GRID    5       0       17267.  1720.   2478.8
 GRID    6       0       17331.  1720.   2563.
-GRID    7       0       17267.  1720.   2478.8
+GRID    7       0       17267.  1720.   2628.
 GRID    8       0       17190.  1720.   2563.
 $
-$ PSHELL property
+$ ── Shell property & element ────────────────────────────
 PSHELL  1001    1       10.     1
-$
-$ CQUAD8 element (corners: 1,2,3,4 | mid-edge: 5,6,7,8)
 CQUAD8  101     1001    1       2       3       4       5       6
         7       8
+$
+$ ── Bar properties ──────────────────────────────────────
+$ X-direction bars (vertical edges: left=8/4/1 side, right=2/6/3 side)
+PBAR    201     1       500.    1000.   500.    200.
+$ Y-direction bars (horizontal edges: bottom=1/5/2, top=4/7/3)
+PBAR    202     1       300.    600.    300.    100.
+$
+$ ── CBAR elements on edges ──────────────────────────────
+$ Bottom edge (Y bar): node1→node5, node5→node2
+CBAR    301     202     1       5       0.      1.      0.
+CBAR    302     202     5       2       0.      1.      0.
+$ Top edge (Y bar): node4→node7, node7→node3
+CBAR    303     202     4       7       0.      1.      0.
+CBAR    304     202     7       3       0.      1.      0.
+$ Left edge (X bar): node1→node8, node8→node4
+CBAR    305     201     1       8       1.      0.      0.
+CBAR    306     201     8       4       1.      0.      0.
+$ Right edge (X bar): node2→node6, node6→node3
+CBAR    307     201     2       6       1.      0.      0.
+CBAR    308     201     6       3       1.      0.      0.
 $
 ENDDATA
