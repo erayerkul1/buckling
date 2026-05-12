@@ -1,17 +1,34 @@
 """
 Panel Length Calculator
------------------------
-Given a BDF file and a property ID:
-- Finds panel X/Y average lengths (X = long side)
-- Finds the bar property on each of the 4 edges (X1, X2, Y1, Y2)
+=======================
+Spyder'da F5 ile çalıştır → arayüz açılır.
+
+- BDF dosyası seç
+- Property ID'leri virgülle gir  (örn: 1, 2, 3)
+- CSV kayıt yolunu seç
+- Calculate → sonuçlar tabloda + CSV'ye yazılır
 """
 
 import sys
+import os
+import csv
 import numpy as np
 from itertools import combinations
 from scipy.spatial import ConvexHull
 from pyNastran.bdf.bdf import BDF
 
+from PyQt5.QtWidgets import (
+    QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
+    QLabel, QPushButton, QLineEdit, QTextEdit, QFileDialog,
+    QTableWidget, QTableWidgetItem, QHeaderView, QProgressBar,
+    QFrame, QAbstractItemView, QMessageBox,
+)
+from PyQt5.QtCore import Qt, QThread, pyqtSignal, QObject
+from PyQt5.QtGui import QColor
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  HESAPLAMA MOTORU
+# ═══════════════════════════════════════════════════════════════════════════════
 
 SHELL_TYPES = {"CQUAD4": 4, "CQUAD8": 4, "CTRIA3": 3, "CTRIA6": 3}
 BAR_TYPES   = {"CBAR", "CBEAM", "CROD", "CTUBE"}
@@ -23,306 +40,576 @@ def load_bdf(bdf_path: str) -> BDF:
     return model
 
 
-# ── Node collection ─────────────────────────────────────────────────────────
+def _node_coords(model, nids):
+    return {n: np.array(model.nodes[n].get_position(), dtype=float) for n in nids}
 
-def get_corner_nodes_for_property(model: BDF, property_id: int) -> dict[int, np.ndarray]:
-    """Corner nodes only (first N nodes of each shell element)."""
+
+def get_corner_nodes(model: BDF, pid: int) -> dict:
     nids = set()
     for elem in model.elements.values():
-        if elem.pid != property_id or elem.type not in SHELL_TYPES:
-            continue
-        nids.update(elem.node_ids[:SHELL_TYPES[elem.type]])
-
+        if elem.pid == pid and elem.type in SHELL_TYPES:
+            nids.update(elem.node_ids[:SHELL_TYPES[elem.type]])
     if not nids:
-        raise ValueError(f"No shell elements found for property ID {property_id}")
+        raise ValueError(f"Property ID {pid} için shell eleman bulunamadı.")
+    return _node_coords(model, nids)
 
-    return {n: np.array(model.nodes[n].get_position(), dtype=float) for n in nids}
 
-
-def get_all_nodes_for_property(model: BDF, property_id: int) -> dict[int, np.ndarray]:
-    """All nodes (corner + mid-edge) for every shell element of the property."""
+def get_all_nodes(model: BDF, pid: int) -> dict:
     nids = set()
     for elem in model.elements.values():
-        if elem.pid != property_id or elem.type not in SHELL_TYPES:
-            continue
-        nids.update(elem.node_ids)
-
-    return {n: np.array(model.nodes[n].get_position(), dtype=float) for n in nids}
+        if elem.pid == pid and elem.type in SHELL_TYPES:
+            nids.update(elem.node_ids)
+    return _node_coords(model, nids)
 
 
-# ── Plane / projection ───────────────────────────────────────────────────────
-
-def detect_plane(coords: dict[int, np.ndarray]) -> str:
+def detect_plane(coords: dict) -> str:
     pts = np.array(list(coords.values()))
-    min_axis = int(np.argmin(pts.var(axis=0)))
-    return {0: "ZY", 1: "XZ", 2: "XY"}[min_axis]
+    min_ax = int(np.argmin(pts.var(axis=0)))
+    return {0: "ZY", 1: "XZ", 2: "XY"}[min_ax]
 
 
-def project_to_plane(coords: dict[int, np.ndarray], plane: str) -> dict[int, np.ndarray]:
+def project_2d(coords: dict, plane: str) -> dict:
     axes = {"XZ": [0, 2], "ZY": [2, 1], "XY": [0, 1]}[plane]
-    return {nid: pt[axes] for nid, pt in coords.items()}
+    return {n: pt[axes] for n, pt in coords.items()}
 
 
-# ── Corner detection ─────────────────────────────────────────────────────────
-
-def find_panel_corners(coords: dict[int, np.ndarray], plane: str) -> list[int]:
-    proj  = project_to_plane(coords, plane)
+def find_corners(coords: dict, plane: str) -> list:
+    proj  = project_2d(coords, plane)
     nids  = list(proj.keys())
     pts2d = np.array([proj[n] for n in nids])
 
     if len(nids) < 4:
-        raise ValueError(f"Only {len(nids)} corner nodes, need at least 4")
+        raise ValueError("4'ten az köşe node bulundu.")
     if len(nids) == 4:
         return nids
 
-    hull      = ConvexHull(pts2d)
-    hull_nids = [nids[i] for i in hull.vertices]
-
+    hull_idx = ConvexHull(pts2d).vertices
+    hull_nids = [nids[i] for i in hull_idx]
     if len(hull_nids) == 4:
         return hull_nids
 
-    # More than 4 hull vertices → pick the quad with maximum area
     best_area, best_quad = -1, None
     for quad in combinations(hull_nids, 4):
-        qpts = pts2d[[nids.index(n) for n in quad]]
-        c    = qpts.mean(axis=0)
-        ang  = np.arctan2(qpts[:, 1] - c[1], qpts[:, 0] - c[0])
-        o    = np.argsort(ang)
-        op   = qpts[o]
-        n    = 4
+        qp = pts2d[[nids.index(n) for n in quad]]
+        c  = qp.mean(axis=0)
+        o  = np.argsort(np.arctan2(qp[:,1]-c[1], qp[:,0]-c[0]))
+        op = qp[o]
         area = 0.5 * abs(sum(
-            op[i][0] * op[(i+1) % n][1] - op[(i+1) % n][0] * op[i][1]
-            for i in range(n)
+            op[i][0]*op[(i+1)%4][1] - op[(i+1)%4][0]*op[i][1] for i in range(4)
         ))
         if area > best_area:
             best_area = area
             best_quad = [quad[i] for i in o]
-
     return best_quad
 
 
-def order_corners(corner_nids: list[int], coords: dict[int, np.ndarray], plane: str) -> list[int]:
-    """CCW order: [bottom-left, bottom-right, top-right, top-left]."""
-    proj = project_to_plane({n: coords[n] for n in corner_nids}, plane)
+def order_ccw(corner_nids: list, coords: dict, plane: str) -> list:
+    proj = project_2d({n: coords[n] for n in corner_nids}, plane)
     pts  = np.array([proj[n] for n in corner_nids])
     c    = pts.mean(axis=0)
-    ang  = np.arctan2(pts[:, 1] - c[1], pts[:, 0] - c[0])
+    ang  = np.arctan2(pts[:,1]-c[1], pts[:,0]-c[0])
     return [corner_nids[i] for i in np.argsort(ang)]
 
 
-# ── Edge node finding ────────────────────────────────────────────────────────
+def dist(a: np.ndarray, b: np.ndarray) -> float:
+    return float(np.linalg.norm(a - b))
 
-def get_nodes_on_edge(
-    all_coords: dict[int, np.ndarray],
-    nid_a: int,
-    nid_b: int,
-) -> set[int]:
-    """All nodes that lie on the segment A→B (including A and B)."""
-    pa       = all_coords[nid_a]
-    pb       = all_coords[nid_b]
+
+def nodes_on_segment(all_coords: dict, a: int, b: int) -> set:
+    pa, pb   = all_coords[a], all_coords[b]
     edge_vec = pb - pa
-    edge_len_sq = float(np.dot(edge_vec, edge_vec))
-    tol      = 1e-4
-
-    edge_len = np.sqrt(edge_len_sq)
-    # Allow up to 1% of edge length as perpendicular deviation (handles slightly
-    # trapezoidal panels where mid-edge nodes are not perfectly collinear)
-    dist_tol = max(0.01 * edge_len, 1e-3)
+    edge_lsq = float(np.dot(edge_vec, edge_vec))
+    edge_len = np.sqrt(edge_lsq)
+    tol_perp = max(0.01 * edge_len, 1e-3)
+    tol_t    = 1e-4
 
     on_edge = set()
     for nid, pt in all_coords.items():
         v = pt - pa
-        t = float(np.dot(v, edge_vec)) / edge_len_sq if edge_len_sq > 0 else 0.0
-        if t < -tol or t > 1.0 + tol:
+        t = float(np.dot(v, edge_vec)) / edge_lsq if edge_lsq > 0 else 0.0
+        if t < -tol_t or t > 1.0 + tol_t:
             continue
-        proj = pa + t * edge_vec
-        if np.linalg.norm(pt - proj) < dist_tol:
+        if np.linalg.norm(pt - (pa + t * edge_vec)) < tol_perp:
             on_edge.add(nid)
-
     return on_edge
 
 
-# ── Bar property lookup ──────────────────────────────────────────────────────
-
-def find_bar_property_for_edge(
-    model: BDF,
-    edge_nodes: set[int],
-) -> tuple[int | None, int]:
-    """
-    Returns (best_property_id, shared_node_count).
-    Best = property whose bar elements share the most nodes with edge_nodes.
-    """
-    prop_nodes: dict[int, set[int]] = {}
-
+def find_bar_prop(model: BDF, edge_nodes: set) -> tuple:
+    """En fazla ortak node'a sahip bar property'yi döndürür."""
+    prop_nodes: dict = {}
     for elem in model.elements.values():
         if elem.type not in BAR_TYPES:
             continue
         pid = elem.pid
-        if pid not in prop_nodes:
-            prop_nodes[pid] = set()
-        prop_nodes[pid].update(elem.node_ids)
+        prop_nodes.setdefault(pid, set()).update(elem.node_ids)
 
-    best_pid, best_count = None, 0
+    best_pid, best_n = None, 0
     for pid, bar_nids in prop_nodes.items():
         shared = len(edge_nodes & bar_nids)
-        if shared > best_count:
-            best_count = shared
-            best_pid   = pid
-
-    return best_pid, best_count
+        if shared > best_n:
+            best_n, best_pid = shared, pid
+    return best_pid, best_n
 
 
-def get_bar_property_dims(model: BDF, bar_pid: int | None) -> tuple:
-    """
-    Returns (dim1, dim2) for the bar property.
-    PBARL/PBEAML → cross-section DIM1, DIM2
-    PBAR/PBEAM   → area (A), moment of inertia I1
-    """
+def get_bar_dims(model: BDF, bar_pid) -> tuple:
     if bar_pid is None or bar_pid not in model.properties:
         return None, None
-
     prop  = model.properties[bar_pid]
     ptype = prop.type
-
     if ptype in ("PBARL", "PBEAML"):
-        dims = prop.dim if hasattr(prop, "dim") else []
-        d1 = round(float(dims[0]), 6) if len(dims) > 0 else None
-        d2 = round(float(dims[1]), 6) if len(dims) > 1 else None
-        return d1, d2
-
+        dims = getattr(prop, "dim", [])
+        return (round(float(dims[0]), 6) if len(dims) > 0 else None,
+                round(float(dims[1]), 6) if len(dims) > 1 else None)
     if ptype == "PBAR":
         return round(float(prop.A), 6), round(float(prop.i1), 6)
-
     if ptype == "PBEAM":
-        a_list  = prop.A  if hasattr(prop, "A")  else [None]
-        i1_list = prop.i1 if hasattr(prop, "i1") else [None]
-        a  = round(float(a_list[0]),  6) if a_list[0]  is not None else None
-        i1 = round(float(i1_list[0]), 6) if i1_list[0] is not None else None
-        return a, i1
-
+        a  = getattr(prop, "A",  [None])
+        i1 = getattr(prop, "i1", [None])
+        return (round(float(a[0]),  6) if a[0]  is not None else None,
+                round(float(i1[0]), 6) if i1[0] is not None else None)
     if ptype == "PROD":
         return round(float(prop.A), 6), None
-
     return None, None
 
 
-# ── Distance helper ──────────────────────────────────────────────────────────
-
-def euclidean(p1: np.ndarray, p2: np.ndarray) -> float:
-    return float(np.linalg.norm(p1 - p2))
-
-
-# ── Main computation ─────────────────────────────────────────────────────────
-
-def compute_panel_lengths(bdf_path: str, property_id: int) -> dict:
+def compute(bdf_path: str, pid: int) -> dict:
     """
-    Returns:
-    {
-        property_id, plane,
-        corner_nodes, edge_lengths,
-        x_length, y_length, x_direction,
-        bars: {
-            "x1": {pid, dim1, dim2, shared_nodes},
-            "x2": {pid, dim1, dim2, shared_nodes},
-            "y1": {pid, dim1, dim2, shared_nodes},
-            "y2": {pid, dim1, dim2, shared_nodes},
-        }
-    }
+    Döndürür:
+        property_id, plane, x_length, y_length, x_direction,
+        bars: { x1, x2, y1, y2 → {pid, dim1, dim2, shared_nodes} }
     """
-    model = load_bdf(bdf_path)
+    model        = load_bdf(bdf_path)
+    corner_c     = get_corner_nodes(model, pid)
+    all_c        = get_all_nodes(model, pid)
+    plane        = detect_plane(corner_c)
+    corners      = find_corners(corner_c, plane)
+    bl, br, tr, tl = order_ccw(corners, corner_c, plane)
 
-    corner_coords = get_corner_nodes_for_property(model, property_id)
-    all_coords    = get_all_nodes_for_property(model, property_id)
+    bottom = dist(corner_c[bl], corner_c[br])
+    right  = dist(corner_c[br], corner_c[tr])
+    top    = dist(corner_c[tr], corner_c[tl])
+    left   = dist(corner_c[tl], corner_c[bl])
 
-    plane      = detect_plane(corner_coords)
-    corner_nids = find_panel_corners(corner_coords, plane)
-    ordered    = order_corners(corner_nids, corner_coords, plane)
+    h_avg, v_avg = (bottom + top) / 2, (left + right) / 2
 
-    # Ordered CCW: [bl, br, tr, tl]
-    bl_id, br_id, tr_id, tl_id = ordered
-    bl, br, tr, tl = [corner_coords[n] for n in ordered]
-
-    bottom = euclidean(bl, br)
-    right  = euclidean(br, tr)
-    top    = euclidean(tr, tl)
-    left   = euclidean(tl, bl)
-
-    horiz_avg = (bottom + top) / 2
-    vert_avg  = (left + right) / 2
-
-    if horiz_avg >= vert_avg:
-        x_length, y_length, x_direction = horiz_avg, vert_avg, "horizontal"
-        x_edges = [("x1", bl_id, br_id), ("x2", tl_id, tr_id)]
-        y_edges = [("y1", tl_id, bl_id), ("y2", br_id, tr_id)]
+    if h_avg >= v_avg:
+        x_len, y_len, x_dir = h_avg, v_avg, "horizontal"
+        x_edges = [("x1", bl, br), ("x2", tl, tr)]
+        y_edges = [("y1", tl, bl), ("y2", br, tr)]
     else:
-        x_length, y_length, x_direction = vert_avg, horiz_avg, "vertical"
-        x_edges = [("x1", tl_id, bl_id), ("x2", br_id, tr_id)]
-        y_edges = [("y1", bl_id, br_id), ("y2", tl_id, tr_id)]
+        x_len, y_len, x_dir = v_avg, h_avg, "vertical"
+        x_edges = [("x1", tl, bl), ("x2", br, tr)]
+        y_edges = [("y1", bl, br), ("y2", tl, tr)]
 
     bars = {}
-    for label, nid_a, nid_b in x_edges + y_edges:
-        edge_nodes = get_nodes_on_edge(all_coords, nid_a, nid_b)
-        pid, shared = find_bar_property_for_edge(model, edge_nodes)
-        d1, d2 = get_bar_property_dims(model, pid)
-        bars[label] = {
-            "pid":          pid,
-            "dim1":         d1,
-            "dim2":         d2,
-            "shared_nodes": shared,
-        }
+    for label, na, nb in x_edges + y_edges:
+        seg        = nodes_on_segment(all_c, na, nb)
+        bpid, shn  = find_bar_prop(model, seg)
+        d1, d2     = get_bar_dims(model, bpid)
+        bars[label] = {"pid": bpid, "dim1": d1, "dim2": d2, "shared_nodes": shn}
 
     return {
-        "property_id": property_id,
-        "plane":        plane,
-        "corner_nodes": ordered,
-        "edge_lengths": {
-            "bottom": round(bottom, 4),
-            "right":  round(right,  4),
-            "top":    round(top,    4),
-            "left":   round(left,   4),
-        },
-        "x_length":    round(x_length, 4),
-        "y_length":    round(y_length, 4),
-        "x_direction": x_direction,
+        "property_id": pid,
+        "plane":       plane,
+        "x_length":    round(x_len, 4),
+        "y_length":    round(y_len, 4),
+        "x_direction": x_dir,
         "bars":        bars,
     }
 
 
-# ── Print helper ─────────────────────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════════════════
+#  ARAYÜZ
+# ═══════════════════════════════════════════════════════════════════════════════
 
-def print_result(res: dict) -> None:
-    print(f"\n{'='*56}")
-    print(f"Property ID : {res['property_id']}   Plane: {res['plane']}")
-    print(f"Corner Nodes: {res['corner_nodes']}")
-    print(f"{'='*56}")
-    for side, length in res["edge_lengths"].items():
-        print(f"  {side:<8}: {length:.4f} mm")
-    print(f"{'─'*56}")
-    print(f"  X Length (long,  avg): {res['x_length']:.4f} mm  [{res['x_direction']}]")
-    print(f"  Y Length (short, avg): {res['y_length']:.4f} mm")
-    print(f"{'='*56}")
-    print("  Bar Properties:")
-    for label, b in res["bars"].items():
-        print(f"  {label}: PID={b['pid']}  DIM1={b['dim1']}  DIM2={b['dim2']}"
-              f"  (shared nodes: {b['shared_nodes']})")
-    print(f"{'='*56}\n")
+BG     = "#0f1117"
+CARD   = "#1a1d2e"
+BORDER = "#2e3250"
+ACCENT = "#5c6bc0"
+ACC2   = "#7986cb"
+TEXT   = "#e8eaf6"
+SUB    = "#8892b0"
+GREEN  = "#66bb6a"
+RED    = "#fc8181"
+AMBER  = "#ffa726"
+
+STYLE = f"""
+QMainWindow, QWidget  {{ background:{BG}; color:{TEXT}; font-family:'Segoe UI','Arial'; font-size:13px; }}
+QLabel                {{ background:transparent; color:{TEXT}; }}
+QLabel#title          {{ font-size:21px; font-weight:700; }}
+QLabel#sub            {{ color:{SUB}; font-size:11px; }}
+QLabel#sec            {{ color:{SUB}; font-size:10px; font-weight:600; letter-spacing:1px; }}
+QLineEdit             {{ background:{CARD}; border:1.5px solid {BORDER}; border-radius:8px; padding:7px 11px; color:{TEXT}; }}
+QLineEdit:focus       {{ border-color:{ACCENT}; }}
+QTextEdit             {{ background:{CARD}; border:1.5px solid {BORDER}; border-radius:8px; padding:7px; color:{TEXT}; }}
+QTextEdit:focus       {{ border-color:{ACCENT}; }}
+QPushButton#pri       {{ background:qlineargradient(x1:0,y1:0,x2:1,y2:1,stop:0 {ACCENT},stop:1 #3f51b5);
+                         color:white; border:none; border-radius:8px; padding:10px 20px; font-weight:600; }}
+QPushButton#pri:hover {{ background:qlineargradient(x1:0,y1:0,x2:1,y2:1,stop:0 {ACC2},stop:1 {ACCENT}); }}
+QPushButton#pri:disabled {{ background:#252840; color:{SUB}; }}
+QPushButton#sec       {{ background:{CARD}; color:{ACC2}; border:1.5px solid {ACCENT}; border-radius:8px; padding:10px 20px; font-weight:600; }}
+QPushButton#sec:hover {{ background:#252840; color:white; }}
+QPushButton#sec:disabled {{ color:{SUB}; border-color:{BORDER}; }}
+QPushButton#brw       {{ background:{CARD}; color:{ACC2}; border:1.5px solid {BORDER}; border-radius:8px; padding:7px 14px; font-size:12px; }}
+QPushButton#brw:hover {{ border-color:{ACCENT}; color:white; }}
+QTableWidget          {{ background:{CARD}; border:1px solid {BORDER}; border-radius:8px;
+                         gridline-color:{BORDER}; color:{TEXT}; font-size:12px; selection-background-color:#252840; }}
+QTableWidget::item    {{ padding:5px 8px; border:none; }}
+QHeaderView::section  {{ background:#1e2130; color:{SUB}; border:none; border-right:1px solid {BORDER};
+                         border-bottom:1px solid {BORDER}; padding:5px 8px; font-size:10px; font-weight:600; letter-spacing:0.8px; }}
+QProgressBar          {{ background:{CARD}; border:1px solid {BORDER}; border-radius:5px; height:5px; color:transparent; }}
+QProgressBar::chunk   {{ background:{ACCENT}; border-radius:5px; }}
+QScrollBar:vertical   {{ background:{BG}; width:7px; border-radius:3px; }}
+QScrollBar::handle:vertical {{ background:{BORDER}; border-radius:3px; min-height:20px; }}
+QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {{ height:0; }}
+"""
+
+BAR_LABELS = ["x1", "x2", "y1", "y2"]
+
+CSV_KEYS = (
+    ["property_id", "x_length", "y_length"]
+    + [f"bar_prop_{l}" for l in BAR_LABELS]
+    + [f"bar_dim1_{l}" for l in BAR_LABELS]
+    + [f"bar_dim2_{l}" for l in BAR_LABELS]
+)
+CSV_HEADERS = (
+    ["property_id", "x", "y"]
+    + [f"bar_prop_{l}" for l in BAR_LABELS]
+    + [f"bar_dim1_{l}" for l in BAR_LABELS]
+    + [f"bar_dim2_{l}" for l in BAR_LABELS]
+)
+
+TABLE_KEYS = (
+    ["property_id", "plane", "x_direction", "x_length", "y_length"]
+    + [f"bar_prop_{l}" for l in BAR_LABELS]
+    + [f"bar_dim1_{l}" for l in BAR_LABELS]
+    + [f"bar_dim2_{l}" for l in BAR_LABELS]
+)
+TABLE_HDRS = (
+    ["Prop ID", "Plane", "X Yönü", "X Length\n(mm)", "Y Length\n(mm)"]
+    + [f"Bar PID\n{l.upper()}" for l in BAR_LABELS]
+    + [f"Dim1\n{l.upper()}"   for l in BAR_LABELS]
+    + [f"Dim2\n{l.upper()}"   for l in BAR_LABELS]
+)
 
 
-# ── Run (Spyder / terminal) ───────────────────────────────────────────────────
-# Edit BDF_PATH and PROPERTY_IDS below, then run the script in Spyder.
+class Worker(QObject):
+    progress = pyqtSignal(int, int)
+    row_done = pyqtSignal(dict)
+    err_done = pyqtSignal(int, str)
+    finished = pyqtSignal()
 
-BDF_PATH     = r"test_panel.bdf"   # <-- BDF dosya yolu
-PROPERTY_IDS = [1001]              # <-- İstediğin property ID'leri listesi
+    def __init__(self, bdf_path, pids):
+        super().__init__()
+        self.bdf_path = bdf_path
+        self.pids     = pids
+
+    def run(self):
+        for i, pid in enumerate(self.pids):
+            try:
+                self.row_done.emit(compute(self.bdf_path, pid))
+            except Exception as e:
+                self.err_done.emit(pid, str(e))
+            self.progress.emit(i + 1, len(self.pids))
+        self.finished.emit()
+
+
+def _card():
+    f = QFrame()
+    f.setStyleSheet(f"QFrame{{background:{CARD};border:1px solid {BORDER};border-radius:12px;}}")
+    return f
+
+
+def _sec(text):
+    l = QLabel(text.upper())
+    l.setObjectName("sec")
+    return l
+
+
+def _divider():
+    d = QFrame()
+    d.setFixedHeight(1)
+    d.setStyleSheet(f"background:{BORDER};border:none;")
+    return d
+
+
+class App(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("Panel Length Calculator")
+        self.resize(1350, 760)
+        self.setStyleSheet(STYLE)
+        self._rows = []
+        self._build()
+
+    def _build(self):
+        root = QWidget()
+        self.setCentralWidget(root)
+        lay = QVBoxLayout(root)
+        lay.setContentsMargins(24, 20, 24, 20)
+        lay.setSpacing(14)
+
+        # ── Başlık ────────────────────────────────────────────────────────────
+        hdr = QHBoxLayout()
+        t = QLabel("📐  Panel Length Calculator")
+        t.setObjectName("title")
+        s = QLabel("BDF seç · Property ID'leri gir · CSV kaydet")
+        s.setObjectName("sub")
+        hdr.addWidget(t)
+        hdr.addStretch()
+        hdr.addWidget(s, alignment=Qt.AlignBottom)
+        lay.addLayout(hdr)
+        lay.addWidget(_divider())
+
+        # ── Giriş kartları (3 sütun) ──────────────────────────────────────────
+        inp = QHBoxLayout()
+        inp.setSpacing(14)
+        inp.addWidget(self._bdf_card(),  3)
+        inp.addWidget(self._pid_card(),  2)
+        inp.addWidget(self._csv_card(),  3)
+        lay.addLayout(inp)
+
+        # ── Butonlar ──────────────────────────────────────────────────────────
+        btn_row = QHBoxLayout()
+        btn_row.setSpacing(10)
+        self.btn_calc = QPushButton("▶  Calculate")
+        self.btn_calc.setObjectName("pri")
+        self.btn_calc.setFixedHeight(42)
+        self.btn_export = QPushButton("⬇  CSV Kaydet")
+        self.btn_export.setObjectName("sec")
+        self.btn_export.setFixedHeight(42)
+        self.btn_export.setEnabled(False)
+        self.btn_calc.clicked.connect(self._calc)
+        self.btn_export.clicked.connect(self._export)
+        btn_row.addWidget(self.btn_calc, 3)
+        btn_row.addWidget(self.btn_export, 1)
+        lay.addLayout(btn_row)
+
+        # ── Progress + status ─────────────────────────────────────────────────
+        self.prog = QProgressBar()
+        self.prog.setFixedHeight(5)
+        self.prog.setVisible(False)
+        lay.addWidget(self.prog)
+
+        self.status = QLabel("")
+        self.status.setObjectName("sub")
+        lay.addWidget(self.status)
+
+        # ── Sonuç tablosu ─────────────────────────────────────────────────────
+        lay.addWidget(self._table_card(), 1)
+
+    # ── Kart builder'ları ─────────────────────────────────────────────────────
+
+    def _bdf_card(self):
+        c = _card()
+        v = QVBoxLayout(c)
+        v.setContentsMargins(16, 14, 16, 14)
+        v.setSpacing(8)
+        v.addWidget(_sec("① BDF Dosyası"))
+        row = QHBoxLayout()
+        self.bdf_edit = QLineEdit()
+        self.bdf_edit.setPlaceholderText(".bdf / .dat / .nas dosyası seçin…")
+        self.bdf_edit.setReadOnly(True)
+        b = QPushButton("Seç…")
+        b.setObjectName("brw")
+        b.setFixedHeight(36)
+        b.clicked.connect(self._browse_bdf)
+        row.addWidget(self.bdf_edit)
+        row.addWidget(b)
+        v.addLayout(row)
+        return c
+
+    def _pid_card(self):
+        c = _card()
+        v = QVBoxLayout(c)
+        v.setContentsMargins(16, 14, 16, 14)
+        v.setSpacing(8)
+        v.addWidget(_sec("② Property ID'ler"))
+        self.pid_edit = QTextEdit()
+        self.pid_edit.setPlaceholderText("Virgülle ayır:\n1, 2, 3")
+        self.pid_edit.setFixedHeight(70)
+        v.addWidget(self.pid_edit)
+        return c
+
+    def _csv_card(self):
+        c = _card()
+        v = QVBoxLayout(c)
+        v.setContentsMargins(16, 14, 16, 14)
+        v.setSpacing(8)
+        v.addWidget(_sec("③ CSV Kayıt Yolu"))
+        row = QHBoxLayout()
+        self.csv_edit = QLineEdit()
+        self.csv_edit.setPlaceholderText("panel_lengths.csv kayıt yolu…")
+        b = QPushButton("Seç…")
+        b.setObjectName("brw")
+        b.setFixedHeight(36)
+        b.clicked.connect(self._browse_csv)
+        row.addWidget(self.csv_edit)
+        row.addWidget(b)
+        v.addLayout(row)
+        return c
+
+    def _table_card(self):
+        c = _card()
+        v = QVBoxLayout(c)
+        v.setContentsMargins(16, 12, 16, 12)
+        v.setSpacing(8)
+        v.addWidget(_sec("④ Sonuçlar"))
+        self.table = QTableWidget(0, len(TABLE_KEYS))
+        self.table.setHorizontalHeaderLabels(TABLE_HDRS)
+        self.table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.table.verticalHeader().setVisible(False)
+        self.table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeToContents)
+        self.table.horizontalHeader().setStretchLastSection(True)
+        v.addWidget(self.table)
+        return c
+
+    # ── Dosya seçiciler ───────────────────────────────────────────────────────
+
+    def _browse_bdf(self):
+        p, _ = QFileDialog.getOpenFileName(
+            self, "BDF Dosyası Seç", "",
+            "BDF Files (*.bdf *.dat *.nas *.pch);;All Files (*)"
+        )
+        if p:
+            self.bdf_edit.setText(p)
+            if not self.csv_edit.text():
+                default_csv = os.path.splitext(p)[0] + "_panel_lengths.csv"
+                self.csv_edit.setText(default_csv)
+
+    def _browse_csv(self):
+        p, _ = QFileDialog.getSaveFileName(
+            self, "CSV Kayıt Yeri", self.csv_edit.text() or "panel_lengths.csv",
+            "CSV Files (*.csv);;All Files (*)"
+        )
+        if p:
+            self.csv_edit.setText(p)
+
+    # ── Hesaplama ─────────────────────────────────────────────────────────────
+
+    def _parse_pids(self):
+        raw = self.pid_edit.toPlainText().replace(",", " ")
+        return [int(t) for t in raw.split() if t.strip()]
+
+    def _calc(self):
+        bdf = self.bdf_edit.text().strip()
+        if not bdf:
+            QMessageBox.warning(self, "Eksik", "BDF dosyası seçin.")
+            return
+        try:
+            pids = self._parse_pids()
+        except ValueError:
+            QMessageBox.warning(self, "Hata", "Property ID'ler tam sayı olmalı.")
+            return
+        if not pids:
+            QMessageBox.warning(self, "Eksik", "En az bir property ID girin.")
+            return
+
+        self._rows.clear()
+        self.table.setRowCount(0)
+        self.btn_calc.setEnabled(False)
+        self.btn_export.setEnabled(False)
+        self.prog.setVisible(True)
+        self.prog.setMaximum(len(pids))
+        self.prog.setValue(0)
+        self.status.setText("Hesaplanıyor…")
+
+        self._thread = QThread()
+        self._worker = Worker(bdf, pids)
+        self._worker.moveToThread(self._thread)
+        self._thread.started.connect(self._worker.run)
+        self._worker.progress.connect(lambda c, t: self.prog.setValue(c))
+        self._worker.row_done.connect(self._add_row)
+        self._worker.err_done.connect(self._add_err)
+        self._worker.finished.connect(self._done)
+        self._worker.finished.connect(self._thread.quit)
+        self._thread.start()
+
+    def _flat(self, res: dict) -> dict:
+        d = {k: res[k] for k in ("property_id", "plane", "x_direction", "x_length", "y_length")}
+        for lbl in BAR_LABELS:
+            b = res["bars"][lbl]
+            d[f"bar_prop_{lbl}"] = b["pid"]
+            d[f"bar_dim1_{lbl}"] = b["dim1"]
+            d[f"bar_dim2_{lbl}"] = b["dim2"]
+        return d
+
+    def _add_row(self, res: dict):
+        row = self._flat(res)
+        self._rows.append(row)
+        r = self.table.rowCount()
+        self.table.insertRow(r)
+        for c, key in enumerate(TABLE_KEYS):
+            val = row.get(key)
+            item = QTableWidgetItem("" if val is None else str(val))
+            item.setTextAlignment(Qt.AlignCenter)
+            if key == "x_length":
+                item.setForeground(QColor(ACC2))
+            elif key == "y_length":
+                item.setForeground(QColor(GREEN))
+            elif key.startswith("bar_prop") and val is not None:
+                item.setForeground(QColor(AMBER))
+            self.table.setItem(r, c, item)
+
+    def _add_err(self, pid: int, msg: str):
+        r = self.table.rowCount()
+        self.table.insertRow(r)
+        it = QTableWidgetItem(f"PID {pid} — {msg}")
+        it.setForeground(QColor(RED))
+        self.table.setItem(r, 0, it)
+
+    def _done(self):
+        self.btn_calc.setEnabled(True)
+        self.btn_export.setEnabled(bool(self._rows))
+        self.prog.setVisible(False)
+        err = self.table.rowCount() - len(self._rows)
+        parts = [f"{len(self._rows)} başarılı"]
+        if err:
+            parts.append(f"{err} hatalı")
+        self.status.setText("  ·  ".join(parts))
+
+        # CSV yolu seçiliyse otomatik kaydet
+        csv_path = self.csv_edit.text().strip()
+        if csv_path and self._rows:
+            self._write_csv(csv_path)
+            self.status.setText(self.status.text() + f"  ·  Kaydedildi → {csv_path}")
+
+    # ── CSV dışa aktarım ──────────────────────────────────────────────────────
+
+    def _export(self):
+        path = self.csv_edit.text().strip()
+        if not path:
+            path, _ = QFileDialog.getSaveFileName(
+                self, "CSV Kaydet", "panel_lengths.csv",
+                "CSV Files (*.csv);;All Files (*)"
+            )
+            if not path:
+                return
+            self.csv_edit.setText(path)
+        self._write_csv(path)
+        self.status.setText(f"Kaydedildi → {path}")
+
+    def _write_csv(self, path: str):
+        try:
+            with open(path, "w", newline="", encoding="utf-8") as f:
+                w = csv.writer(f)
+                w.writerow(CSV_HEADERS)
+                for row in self._rows:
+                    w.writerow([row.get(k, "") for k in CSV_KEYS])
+        except Exception as e:
+            QMessageBox.critical(self, "CSV Hatası", str(e))
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  BAŞLAT  (Spyder: F5 · Terminal: python panel_length_calculator.py)
+# ═══════════════════════════════════════════════════════════════════════════════
 
 if __name__ == "__main__":
-    # Terminal: python panel_length_calculator.py model.bdf 1001 1002
-    cli_args = [a for a in sys.argv[1:] if not a.startswith("-")]
-    if len(cli_args) >= 2:
-        BDF_PATH     = cli_args[0]
-        PROPERTY_IDS = [int(x) for x in cli_args[1:]]
-
-    for pid in PROPERTY_IDS:
-        try:
-            print_result(compute_panel_lengths(BDF_PATH, pid))
-        except Exception as exc:
-            print(f"[ERROR] PID {pid}: {exc}")
+    app = QApplication.instance() or QApplication(sys.argv)
+    win = App()
+    win.show()
+    try:
+        app.exec_()
+    except SystemExit:
+        pass
