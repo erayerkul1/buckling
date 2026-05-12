@@ -208,6 +208,15 @@ def compute(bdf_path: str, pid: int) -> dict:
         d1, d2     = get_bar_dims(model, bpid)
         bars[label] = {"pid": bpid, "dim1": d1, "dim2": d2, "shared_nodes": shn}
 
+    def _avg(vals):
+        v = [x for x in vals if x is not None]
+        return round(sum(v) / len(v), 6) if v else None
+
+    avg_dim1_x = _avg([bars["x1"]["dim1"], bars["x2"]["dim1"]])
+    avg_dim2_x = _avg([bars["x1"]["dim2"], bars["x2"]["dim2"]])
+    avg_dim1_y = _avg([bars["y1"]["dim1"], bars["y2"]["dim1"]])
+    avg_dim2_y = _avg([bars["y1"]["dim2"], bars["y2"]["dim2"]])
+
     return {
         "property_id": pid,
         "plane":       plane,
@@ -215,6 +224,10 @@ def compute(bdf_path: str, pid: int) -> dict:
         "y_length":    round(y_len, 4),
         "x_direction": x_dir,
         "bars":        bars,
+        "avg_dim1_x":  avg_dim1_x,
+        "avg_dim2_x":  avg_dim2_x,
+        "avg_dim1_y":  avg_dim1_y,
+        "avg_dim2_y":  avg_dim2_y,
     }
 
 
@@ -266,30 +279,27 @@ QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {{ height:0; }}
 
 BAR_LABELS = ["x1", "x2", "y1", "y2"]
 
+# Her bar için prop→dim1→dim2 yan yana, sonuna avg'lar
 CSV_KEYS = (
     ["property_id", "x_length", "y_length"]
-    + [f"bar_prop_{l}" for l in BAR_LABELS]
-    + [f"bar_dim1_{l}" for l in BAR_LABELS]
-    + [f"bar_dim2_{l}" for l in BAR_LABELS]
+    + [k for l in BAR_LABELS for k in (f"bar_prop_{l}", f"bar_dim1_{l}", f"bar_dim2_{l}")]
+    + ["avg_dim1_x", "avg_dim2_x", "avg_dim1_y", "avg_dim2_y"]
 )
 CSV_HEADERS = (
     ["property_id", "x", "y"]
-    + [f"bar_prop_{l}" for l in BAR_LABELS]
-    + [f"bar_dim1_{l}" for l in BAR_LABELS]
-    + [f"bar_dim2_{l}" for l in BAR_LABELS]
+    + [k for l in BAR_LABELS for k in (f"bar_prop_{l}", f"bar_dim1_{l}", f"bar_dim2_{l}")]
+    + ["avg_dim1_x", "avg_dim2_x", "avg_dim1_y", "avg_dim2_y"]
 )
 
 TABLE_KEYS = (
     ["property_id", "plane", "x_direction", "x_length", "y_length"]
-    + [f"bar_prop_{l}" for l in BAR_LABELS]
-    + [f"bar_dim1_{l}" for l in BAR_LABELS]
-    + [f"bar_dim2_{l}" for l in BAR_LABELS]
+    + [k for l in BAR_LABELS for k in (f"bar_prop_{l}", f"bar_dim1_{l}", f"bar_dim2_{l}")]
+    + ["avg_dim1_x", "avg_dim2_x", "avg_dim1_y", "avg_dim2_y"]
 )
 TABLE_HDRS = (
     ["Prop ID", "Plane", "X Yönü", "X Length\n(mm)", "Y Length\n(mm)"]
-    + [f"Bar PID\n{l.upper()}" for l in BAR_LABELS]
-    + [f"Dim1\n{l.upper()}"   for l in BAR_LABELS]
-    + [f"Dim2\n{l.upper()}"   for l in BAR_LABELS]
+    + [k for l in BAR_LABELS for k in (f"Bar PID\n{l.upper()}", f"Dim1\n{l.upper()}", f"Dim2\n{l.upper()}")]
+    + ["Avg Dim1\nX", "Avg Dim2\nX", "Avg Dim1\nY", "Avg Dim2\nY"]
 )
 
 
@@ -533,6 +543,10 @@ class App(QMainWindow):
             d[f"bar_prop_{lbl}"] = b["pid"]
             d[f"bar_dim1_{lbl}"] = b["dim1"]
             d[f"bar_dim2_{lbl}"] = b["dim2"]
+        d["avg_dim1_x"] = res["avg_dim1_x"]
+        d["avg_dim2_x"] = res["avg_dim2_x"]
+        d["avg_dim1_y"] = res["avg_dim1_y"]
+        d["avg_dim2_y"] = res["avg_dim2_y"]
         return d
 
     def _add_row(self, res: dict):
