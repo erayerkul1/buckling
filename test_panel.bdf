@@ -1,0 +1,23 @@
+$ pyNastran : punch=True
+$ Test BDF - Panel in XZ plane (Y=1720 constant)
+$ Corners: (17190,1720,2628), (17331,1720,2628), (17329,1720,2473.8), (17190,1720,2478.8)
+$
+$ GRID nodes - Corner nodes
+GRID    1       0       17190.  1720.   2628.
+GRID    2       0       17331.  1720.   2628.
+GRID    3       0       17329.  1720.   2473.8
+GRID    4       0       17190.  1720.   2478.8
+$ Mid-edge nodes
+GRID    5       0       17267.  1720.   2628.
+GRID    6       0       17331.  1720.   2563.
+GRID    7       0       17267.  1720.   2478.8
+GRID    8       0       17190.  1720.   2563.
+$
+$ PSHELL property
+PSHELL  1001    1       10.     1
+$
+$ CQUAD8 element (corners: 1,2,3,4 | mid-edge: 5,6,7,8)
+CQUAD8  101     1001    1       2       3       4       5       6
+        7       8
+$
+ENDDATA
