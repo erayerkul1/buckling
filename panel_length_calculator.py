@@ -288,15 +288,9 @@ def compute_panel_lengths(bdf_path: str, property_id: int) -> dict:
     }
 
 
-# ── CLI ──────────────────────────────────────────────────────────────────────
+# ── Print helper ─────────────────────────────────────────────────────────────
 
-def main():
-    if len(sys.argv) < 3:
-        print("Usage: python panel_length_calculator.py <bdf_file> <property_id>")
-        sys.exit(1)
-
-    res = compute_panel_lengths(sys.argv[1], int(sys.argv[2]))
-
+def print_result(res: dict) -> None:
     print(f"\n{'='*56}")
     print(f"Property ID : {res['property_id']}   Plane: {res['plane']}")
     print(f"Corner Nodes: {res['corner_nodes']}")
@@ -314,5 +308,21 @@ def main():
     print(f"{'='*56}\n")
 
 
+# ── Run (Spyder / terminal) ───────────────────────────────────────────────────
+# Edit BDF_PATH and PROPERTY_IDS below, then run the script in Spyder.
+
+BDF_PATH     = r"test_panel.bdf"   # <-- BDF dosya yolu
+PROPERTY_IDS = [1001]              # <-- İstediğin property ID'leri listesi
+
 if __name__ == "__main__":
-    main()
+    # Terminal: python panel_length_calculator.py model.bdf 1001 1002
+    cli_args = [a for a in sys.argv[1:] if not a.startswith("-")]
+    if len(cli_args) >= 2:
+        BDF_PATH     = cli_args[0]
+        PROPERTY_IDS = [int(x) for x in cli_args[1:]]
+
+    for pid in PROPERTY_IDS:
+        try:
+            print_result(compute_panel_lengths(BDF_PATH, pid))
+        except Exception as exc:
+            print(f"[ERROR] PID {pid}: {exc}")
